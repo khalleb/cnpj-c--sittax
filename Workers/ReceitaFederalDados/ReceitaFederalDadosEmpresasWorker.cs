@@ -118,7 +118,7 @@ namespace Sittax.Cnpj.Workers.ReceitaFederalDados
                 // //2. Download dos arquivos
                 _logger.LogInformation("📥 Fase 1/3: Download dos arquivos ZIP");
                 await ExecutarDownloadArquivosAsync(periodo, cts.Token);
-                //
+
                 // // 3. Descompactação
                 _logger.LogInformation("📦 Fase 2/3: Descompactação dos arquivos");
                 await ExecutarDescompactacaoAsync(periodo, cts.Token);
@@ -591,7 +591,6 @@ namespace Sittax.Cnpj.Workers.ReceitaFederalDados
 
         private string ValidarEObterCaminhoSeguro(string originalPath)
         {
-
             var fileName = Path.GetFileName(originalPath);
 
             if (string.IsNullOrWhiteSpace(fileName))
@@ -610,7 +609,6 @@ namespace Sittax.Cnpj.Workers.ReceitaFederalDados
         private async Task<string?> ExtrairEntryAsync(ZipArchiveEntry entry, string targetDirectory,
             CancellationToken cancellationToken)
         {
-
             var safePath = ValidarEObterCaminhoSeguro(entry.FullName);
             if (string.IsNullOrEmpty(safePath))
             {
