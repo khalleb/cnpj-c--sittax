@@ -1,12 +1,10 @@
 ﻿using System.IO.Compression;
 using System.Text.RegularExpressions;
-
 using Sittax.Cnpj.Services;
-using Sittax.Cnpj.Workers.ReceitaFederalDados;
-
+using Sittax.Utils;
 using STX.Core;
 
-namespace Sittax.Cnpj.Workers
+namespace Sittax.Cnpj.Workers.ReceitaFederalDados
 {
     public class ReceitaFederalDadosEmpresasWorker : IHostedService
     {
@@ -33,7 +31,9 @@ namespace Sittax.Cnpj.Workers
         private readonly int _maxRetries = 7;
         private readonly int _timeoutMinutes = 60;
 
-        public ReceitaFederalDadosEmpresasWorker(ILogger<ReceitaFederalDadosEmpresasWorker> logger, IServiceProvider serviceProvider, GerenciadorDownloadProgresso progressManager, IConfiguration configuration)
+        public ReceitaFederalDadosEmpresasWorker(ILogger<ReceitaFederalDadosEmpresasWorker> logger,
+            IServiceProvider serviceProvider, GerenciadorDownloadProgresso progressManager,
+            IConfiguration configuration)
         {
             _logger = logger;
             _serviceProvider = serviceProvider;
@@ -55,12 +55,15 @@ namespace Sittax.Cnpj.Workers
 
             // Configurar HttpClient
             _httpClient = new HttpClient { Timeout = TimeSpan.FromMinutes(_timeoutMinutes) };
-            _httpClient.DefaultRequestHeaders.UserAgent.Add(new System.Net.Http.Headers.ProductInfoHeaderValue("ReceitaFederalSync", "2.0"));
+            _httpClient.DefaultRequestHeaders.UserAgent.Add(
+                new System.Net.Http.Headers.ProductInfoHeaderValue("ReceitaFederalSync", "2.0"));
 
             _downloadSemaphore = new SemaphoreSlim(_maxParallelDownloads, _maxParallelDownloads);
 
             // Log das configurações
-            _logger.LogInformation("Worker configurado: DeleteZip={DeleteZip}, MinSpace={MinSpace}GB, ValidateCsv={Validate}, RegisterAll={RegisterAll}", _deleteZipAfterExtraction, _minimumFreeSpaceGB, _validateCsvIntegrity, _registerAllCsvFiles);
+            _logger.LogInformation(
+                "Worker configurado: DeleteZip={DeleteZip}, MinSpace={MinSpace}GB, ValidateCsv={Validate}, RegisterAll={RegisterAll}",
+                _deleteZipAfterExtraction, _minimumFreeSpaceGB, _validateCsvIntegrity, _registerAllCsvFiles);
         }
 
         public Task StartAsync(CancellationToken cancellationToken)
@@ -68,7 +71,8 @@ namespace Sittax.Cnpj.Workers
             _logger.LogInformation("Iniciando ReceitaFederalDadosEmpresasWorker");
 
             // Executar imediatamente e depois a cada 24 horas
-            _TimerProcessarDadosReceitaFederal = new XTimer(ProcessarDadosReceitaFederal, null, TimeSpan.Zero, TimeSpan.FromDays(1));
+            _TimerProcessarDadosReceitaFederal =
+                new XTimer(ProcessarDadosReceitaFederal, null, TimeSpan.Zero, TimeSpan.FromDays(1));
 
             return Task.CompletedTask;
         }
@@ -91,12 +95,13 @@ namespace Sittax.Cnpj.Workers
                 _logger.LogInformation("=== Iniciando processamento dos dados da Receita Federal ===");
 
                 var cts = new CancellationTokenSource();
-                cts.CancelAfter(TimeSpan.FromHours(6));
+                cts.CancelAfter(TimeSpan.FromHours(12)); // Aumentado para dar tempo de processar os CSVs
 
                 // Verificar espaço em disco antes de iniciar
                 if (!await VerificarEspacoEmDiscoAsync())
                 {
-                    _logger.LogError("Espaço em disco insuficiente. Mínimo necessário: {MinSpace}GB", _minimumFreeSpaceGB);
+                    _logger.LogError("Espaço em disco insuficiente. Mínimo necessário: {MinSpace}GB",
+                        _minimumFreeSpaceGB);
                     return;
                 }
 
@@ -108,30 +113,188 @@ namespace Sittax.Cnpj.Workers
                     return;
                 }
 
-                // 2. Download dos arquivos
-                await ExecutarDownloadArquivosAsync(periodo, cts.Token);
+                _logger.LogInformation("📅 Processando período: {Periodo}", periodo);
 
-                // 3. Descompactação
+                // //2. Download dos arquivos
+                _logger.LogInformation("📥 Fase 1/3: Download dos arquivos ZIP");
+                await ExecutarDownloadArquivosAsync(periodo, cts.Token);
+                //
+                // // 3. Descompactação
+                _logger.LogInformation("📦 Fase 2/3: Descompactação dos arquivos");
                 await ExecutarDescompactacaoAsync(periodo, cts.Token);
 
-                _logger.LogInformation("=== Processamento concluído com sucesso para período {Periodo} ===", periodo);
+                // 4. Processamento dos CSVs e salvamento no banco
+                _logger.LogInformation("💾 Fase 3/3: Processamento e salvamento no banco de dados");
+                await ProcessarCsvESalvarNoBancoDeDadosAsync(periodo, cts.Token);
+
+                // 5. Limpeza opcional
+                if (_deleteZipAfterExtraction)
+                    await LimparArquivosProcessadosAsync(periodo);
+
+                _logger.LogInformation("✅ === Processamento concluído com sucesso para período {Periodo} ===", periodo);
             }
             catch (OperationCanceledException)
             {
-                _logger.LogWarning("Processamento cancelado por timeout");
+                _logger.LogWarning("⚠️ Processamento cancelado por timeout");
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Erro durante o processamento dos dados da Receita Federal");
+                _logger.LogError(ex, "❌ Erro durante o processamento dos dados da Receita Federal");
             }
         }
 
-        private async Task ProcessarCsvEsalvarNoBancoDeDados()
+        private async Task ProcessarCsvESalvarNoBancoDeDadosAsync(string periodo, CancellationToken cancellationToken)
         {
-            using var scope = _serviceProvider.CreateScope();
-            var csvServices = scope.ServiceProvider.GetRequiredService<ReceitaFederalCsvProcessorService>();
+            try
+            {
+                _logger.LogInformation("🔄 Iniciando processamento de CSVs para período {Periodo}", periodo);
 
-            csvServices.ProcessarCsvIndividualAsync();
+                using var scope = _serviceProvider.CreateScope();
+                var csvService = scope.ServiceProvider.GetRequiredService<ReceitaFederalCsvProcessorService>();
+                var logService = scope.ServiceProvider.GetRequiredService<ReceitaFederalLogArquivosService>();
+
+                // Obter arquivos pendentes de processamento
+                var arquivosPendentes = await logService.ObterArquivosPendentesProcessamentoAsync();
+
+                if (!arquivosPendentes.Any())
+                {
+                    _logger.LogInformation("ℹ️ Nenhum arquivo CSV pendente para processar");
+                    return;
+                }
+
+                _logger.LogInformation("📋 {Count} arquivo(s) CSV pendente(s) para processar", arquivosPendentes.Count);
+
+                var processados = 0;
+                var erros = new List<string>();
+                var tempoInicio = DateTime.Now;
+
+                foreach (var arquivo in arquivosPendentes)
+                {
+                    if (cancellationToken.IsCancellationRequested)
+                    {
+                        _logger.LogWarning("⚠️ Processamento de CSVs cancelado por requisição");
+                        break;
+                    }
+
+                    if (string.IsNullOrEmpty(arquivo.NomeArquivoCsv))
+                    {
+                        _logger.LogWarning("⚠️ Arquivo sem nome de CSV registrado: {ZipFile}", arquivo.NomeArquivoZip);
+                        continue;
+                    }
+
+                    try
+                    {
+                        _logger.LogInformation("📄 Processando CSV {Index}/{Total}: {FileName}", processados + 1,
+                            arquivosPendentes.Count, arquivo.NomeArquivoCsv);
+
+                        await csvService.ProcessarCsvIndividualAsync(arquivo.NomeArquivoCsv, arquivo.Periodo,
+                            cancellationToken);
+
+                        processados++;
+
+                        // Log de progresso a cada 5 arquivos
+                        if (processados % 5 == 0)
+                        {
+                            var tempoDecorrido = DateTime.Now - tempoInicio;
+                            var mediaTempoArquivo = tempoDecorrido.TotalSeconds / processados;
+                            var tempoRestanteEstimado =
+                                TimeSpan.FromSeconds(mediaTempoArquivo * (arquivosPendentes.Count - processados));
+
+                            _logger.LogInformation(
+                                "📊 Progresso: {Processados}/{Total} ({Percentual:F1}%) - Tempo restante estimado: {TempoRestante:hh\\:mm\\:ss}",
+                                processados, arquivosPendentes.Count,
+                                (double) processados / arquivosPendentes.Count * 100, tempoRestanteEstimado);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        var erro = $"Erro ao processar {arquivo.NomeArquivoCsv}: {ex.Message}";
+                        erros.Add(erro);
+                        _logger.LogError(ex, "❌ {Erro}", erro);
+
+                        // Marcar como erro no banco
+                        await logService.AtualizarStatusCsvAsync(arquivo.NomeArquivoCsv, arquivo.Periodo,
+                            StatusCsv.Erro);
+                    }
+                }
+
+                var tempoTotal = DateTime.Now - tempoInicio;
+
+                // Relatório final
+                _logger.LogInformation("📊 RELATÓRIO FINAL DO PROCESSAMENTO DE CSVs:");
+                _logger.LogInformation("   ⏱️ Tempo total: {Tempo:hh\\:mm\\:ss}", tempoTotal);
+                _logger.LogInformation("   ✅ Processados com sucesso: {Count}", processados);
+                _logger.LogInformation("   ❌ Erros: {Count}", erros.Count);
+
+                if (erros.Any())
+                {
+                    foreach (var erro in erros.Take(10))
+                    {
+                        _logger.LogWarning("   - {Erro}", erro);
+                    }
+
+                    if (erros.Count > 10)
+                    {
+                        _logger.LogWarning("   ... e mais {Count} erro(s)", erros.Count - 10);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ Erro durante o processamento dos CSVs");
+                throw;
+            }
+        }
+
+        // Método para limpar arquivos já processados
+        private async Task LimparArquivosProcessadosAsync(string periodo)
+        {
+            try
+            {
+                _logger.LogInformation("🧹 Iniciando limpeza de arquivos processados");
+
+                using var scope = _serviceProvider.CreateScope();
+                var logService = scope.ServiceProvider.GetRequiredService<ReceitaFederalLogArquivosService>();
+
+                var arquivosProcessados = await logService.ObterRelatorioProcessamentoAsync(periodo);
+                var arquivosParaLimpar = arquivosProcessados.Where(a =>
+                    a.StatusDownload == StatusDownload.Finalizado && a.StatusCsv == StatusCsv.Processado).ToList();
+
+                var totalLimpado = 0L;
+                var arquivosRemovidos = 0;
+
+                foreach (var arquivo in arquivosParaLimpar)
+                {
+                    // Remover ZIP se existir
+                    var zipPath = Path.Combine(_downloadDir, arquivo.NomeArquivoZip);
+                    if (File.Exists(zipPath))
+                    {
+                        var size = new FileInfo(zipPath).Length;
+                        await LimparArquivoComSegurancaAsync(zipPath);
+                        totalLimpado += size;
+                        arquivosRemovidos++;
+                    }
+
+                    // Remover CSV se existir
+                    if (!string.IsNullOrEmpty(arquivo.NomeArquivoCsv))
+                    {
+                        var csvPath = Path.Combine(_extractDir, arquivo.NomeArquivoCsv);
+                        if (File.Exists(csvPath))
+                        {
+                            var size = new FileInfo(csvPath).Length;
+                            await LimparArquivoComSegurancaAsync(csvPath);
+                            totalLimpado += size;
+                        }
+                    }
+                }
+
+                _logger.LogInformation("✅ Limpeza concluída: {Count} arquivo(s) removido(s), {Size} liberado(s)",
+                    arquivosRemovidos, FormatarBytes(totalLimpado));
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "⚠️ Erro durante limpeza de arquivos");
+            }
         }
 
         private async Task<bool> VerificarEspacoEmDiscoAsync()
@@ -141,7 +304,8 @@ namespace Sittax.Cnpj.Workers
                 var driveInfo = new DriveInfo(Path.GetPathRoot(_downloadDir) ?? "C:");
                 var freeSpaceGB = driveInfo.AvailableFreeSpace / (1024L * 1024L * 1024L);
 
-                _logger.LogInformation("Espaço livre em disco: {FreeSpace}GB (Mínimo requerido: {MinSpace}GB)", freeSpaceGB, _minimumFreeSpaceGB);
+                _logger.LogInformation("Espaço livre em disco: {FreeSpace}GB (Mínimo requerido: {MinSpace}GB)",
+                    freeSpaceGB, _minimumFreeSpaceGB);
 
                 return freeSpaceGB >= _minimumFreeSpaceGB;
             }
@@ -184,7 +348,8 @@ namespace Sittax.Cnpj.Workers
                         var logExistente = await logService.ObterPorNomeEPeriodoAsync(fileName, periodo);
                         if (logExistente != null && logExistente.StatusCsv == StatusCsv.Extraido)
                         {
-                            _logger.LogInformation("⏭️ Arquivo {FileName} já foi extraído anteriormente, pulando...", fileName);
+                            _logger.LogInformation("⏭️ Arquivo {FileName} já foi extraído anteriormente, pulando...",
+                                fileName);
                             skippedCount++;
                             continue;
                         }
@@ -210,7 +375,8 @@ namespace Sittax.Cnpj.Workers
                         await logService.IniciarDescompactacaoAsync(fileName, periodo);
 
                         // Descompactar para o diretório temporário
-                        var resultado = await DescompactarArquivoIndividualAsync(zipFile, tempExtractDir, cancellationToken);
+                        var resultado =
+                            await DescompactarArquivoIndividualAsync(zipFile, tempExtractDir, cancellationToken);
 
                         // Procurar CSVs no diretório temporário
                         var csvFiles = Directory.GetFiles(tempExtractDir, "*.csv", SearchOption.AllDirectories);
@@ -222,7 +388,8 @@ namespace Sittax.Cnpj.Workers
                             foreach (var csvPath in csvFiles)
                             {
                                 var csvFileName = Path.GetFileName(csvPath);
-                                var finalCsvPath = Path.Combine(_extractDir, $"{Path.GetFileNameWithoutExtension(fileName)}_{csvFileName}");
+                                var finalCsvPath = Path.Combine(_extractDir,
+                                    $"{Path.GetFileNameWithoutExtension(fileName)}_{csvFileName}");
 
                                 // Substituir se já existir
                                 if (File.Exists(finalCsvPath))
@@ -231,7 +398,8 @@ namespace Sittax.Cnpj.Workers
                                 File.Move(csvPath, finalCsvPath);
 
                                 // Validar integridade se configurado
-                                if (_validateCsvIntegrity && !await ValidarIntegridadeCsvAsync(finalCsvPath))
+                                var integridadeArquivo = !await ValidarIntegridadeCsvAsync(finalCsvPath);
+                                if (_validateCsvIntegrity && integridadeArquivo)
                                 {
                                     errors.Add($"CSV corrompido: {Path.GetFileName(finalCsvPath)}");
                                     continue;
@@ -244,7 +412,8 @@ namespace Sittax.Cnpj.Workers
                                 csvInfos.Add((finalCsvPath, fileInfo.Length, hash));
                                 totalCsvCount++;
 
-                                _logger.LogInformation("📄 CSV extraído: {CsvName} ({Size})", Path.GetFileName(finalCsvPath), FormatarBytes(fileInfo.Length));
+                                _logger.LogInformation("📄 CSV extraído: {CsvName} ({Size})",
+                                    Path.GetFileName(finalCsvPath), FormatarBytes(fileInfo.Length));
                             }
 
                             // Registrar CSVs no banco
@@ -253,22 +422,25 @@ namespace Sittax.Cnpj.Workers
                                 // Registrar todos os CSVs
                                 foreach (var (path, size, hash) in csvInfos)
                                 {
-                                    await logService.RegistrarCsvAdicionalAsync(fileName, periodo, Path.GetFileName(path), size, hash);
+                                    await logService.RegistrarCsvAdicionalAsync(fileName, periodo,
+                                        Path.GetFileName(path), size, hash);
                                 }
                             }
-                            else
-                                if (csvInfos.Count > 0)
-                                {
-                                    // Registrar apenas o primeiro/principal
-                                    var principal = csvInfos.First();
-                                    await logService.FinalizarDescompactacaoAsync(fileName, periodo, Path.GetFileName(principal.path), principal.size, principal.hash, sucesso: !resultado.Erros.Any());
-                                }
+                            else if (csvInfos.Count > 0)
+                            {
+                                // Registrar apenas o primeiro/principal
+                                var principal = csvInfos.First();
+                                await logService.FinalizarDescompactacaoAsync(fileName, periodo,
+                                    Path.GetFileName(principal.path), principal.size, principal.hash,
+                                    sucesso: !resultado.Erros.Any());
+                            }
 
                             // Limpar diretório temporário
                             Directory.Delete(tempExtractDir, recursive: true);
 
                             processedCount++;
-                            _logger.LogInformation("✅ Concluído {FileName}: {Extraidos} arquivo(s) extraído(s)", fileName, resultado.ArquivosExtraidos);
+                            _logger.LogInformation("✅ Concluído {FileName}: {Extraidos} arquivo(s) extraído(s)",
+                                fileName, resultado.ArquivosExtraidos);
 
                             // Deletar ZIP se configurado e sucesso total
                             if (_deleteZipAfterExtraction && resultado.Erros.Count == 0)
@@ -324,31 +496,41 @@ namespace Sittax.Cnpj.Workers
         {
             try
             {
-                using var reader = new StreamReader(csvPath);
                 var lineCount = 0;
                 var columnCount = -1;
 
-                while (!reader.EndOfStream && lineCount < 100) // Validar primeiras 100 linhas
+                await foreach (var campos in CsvUtil.LerArquivoCsvAsync(csvPath, CancellationToken.None))
                 {
-                    var line = await reader.ReadLineAsync();
-                    if (string.IsNullOrWhiteSpace(line))
+                    if (campos is null || campos.Length == 0)
                         continue;
 
-                    var columns = line.Split(';').Length;
-
                     if (columnCount == -1)
-                        columnCount = columns;
-                    else
-                        if (columns != columnCount)
-                        {
-                            _logger.LogWarning("CSV com número inconsistente de colunas: {Path}", csvPath);
-                            return false;
-                        }
+                        columnCount = campos.Length;
+                    else if (campos.Length != columnCount)
+                    {
+                        _logger.LogWarning(
+                            "CSV com número inconsistente de colunas na linha {Linha}. Esperado {Esperado}, encontrado {Encontrado}. Arquivo: {Path}",
+                            lineCount + 1, columnCount, campos.Length, csvPath);
+
+                        return false;
+                    }
 
                     lineCount++;
+
+                    // valida apenas as 100 primeiras linhas (ou até o fim do arquivo)
+                    if (lineCount >= 100)
+                        break;
                 }
 
-                return lineCount > 0; // Arquivo não está vazio
+                if (lineCount == 0)
+                {
+                    _logger.LogWarning("CSV vazio ou inválido: {Path}", csvPath);
+                    return false;
+                }
+
+                _logger.LogDebug("Validação de integridade OK: {Path} ({Linhas} linhas analisadas)", csvPath,
+                    lineCount);
+                return true;
             }
             catch (Exception ex)
             {
@@ -358,7 +540,8 @@ namespace Sittax.Cnpj.Workers
         }
 
         // Método auxiliar atualizado para receber o diretório de destino
-        private async Task<ResultadoDescompactacao> DescompactarArquivoIndividualAsync(string zipFilePath, string targetDirectory, CancellationToken cancellationToken)
+        private async Task<ResultadoDescompactacao> DescompactarArquivoIndividualAsync(string zipFilePath,
+            string targetDirectory, CancellationToken cancellationToken)
         {
             var resultado = new ResultadoDescompactacao();
 
@@ -384,7 +567,8 @@ namespace Sittax.Cnpj.Workers
                             if (csvPath != extractedPath)
                             {
                                 resultado.ArquivosRenomeados++;
-                                _logger.LogDebug("🏷️ Renomeado: {Original} → {Novo}", Path.GetFileName(extractedPath), Path.GetFileName(csvPath));
+                                _logger.LogDebug("🏷️ Renomeado: {Original} → {Novo}", Path.GetFileName(extractedPath),
+                                    Path.GetFileName(csvPath));
                             }
                         }
                     }
@@ -407,13 +591,13 @@ namespace Sittax.Cnpj.Workers
 
         private string ValidarEObterCaminhoSeguro(string originalPath)
         {
-            // Pega apenas o nome do arquivo (descarta diretórios internos do zip)
+
             var fileName = Path.GetFileName(originalPath);
 
             if (string.IsNullOrWhiteSpace(fileName))
                 return string.Empty;
 
-            // Substitui caracteres inválidos por underscore
+
             foreach (var invalidChar in Path.GetInvalidFileNameChars())
             {
                 fileName = fileName.Replace(invalidChar, '_');
@@ -422,10 +606,11 @@ namespace Sittax.Cnpj.Workers
             return fileName;
         }
 
-        // Método ExtrairEntryAsync atualizado
-        private async Task<string?> ExtrairEntryAsync(ZipArchiveEntry entry, string targetDirectory, CancellationToken cancellationToken)
+
+        private async Task<string?> ExtrairEntryAsync(ZipArchiveEntry entry, string targetDirectory,
+            CancellationToken cancellationToken)
         {
-            // Validar e criar caminho seguro
+
             var safePath = ValidarEObterCaminhoSeguro(entry.FullName);
             if (string.IsNullOrEmpty(safePath))
             {
@@ -458,7 +643,8 @@ namespace Sittax.Cnpj.Workers
 
             if (!await EhArquivoDadosReceitaFederalAsync(filePath))
             {
-                _logger.LogDebug("📄 Arquivo {FileName} não parece ser dados da RF, mantendo extensão original", Path.GetFileName(filePath));
+                _logger.LogDebug("📄 Arquivo {FileName} não parece ser dados da RF, mantendo extensão original",
+                    Path.GetFileName(filePath));
                 return filePath;
             }
 
@@ -472,7 +658,8 @@ namespace Sittax.Cnpj.Workers
             }
             catch (Exception ex)
             {
-                _logger.LogWarning("⚠️ Erro ao renomear {FileName} para .csv: {Error}", Path.GetFileName(filePath), ex.Message);
+                _logger.LogWarning("⚠️ Erro ao renomear {FileName} para .csv: {Error}", Path.GetFileName(filePath),
+                    ex.Message);
                 return filePath;
             }
         }
@@ -510,8 +697,9 @@ namespace Sittax.Cnpj.Workers
 
                 var padroesDaRF = new[]
                 {
-                    "emprecsv", "empresas", "estabele", "estabelecimentos", "sociocsv", "socios", "simples", "cnaecsv", "cnaes", "natjucsv", "naturezas", "qualscsv", "qualificacoes", "paiscsv", "paises", "municcsv", "municipios", "moticsv",
-                    "motivos"
+                    "emprecsv", "empresas", "estabele", "estabelecimentos", "sociocsv", "socios", "simples",
+                    "cnaecsv", "cnaes", "natjucsv", "naturezas", "qualscsv", "qualificacoes", "paiscsv", "paises",
+                    "municcsv", "municipios", "moticsv", "motivos"
                 };
 
                 var nomeContemPadrao = padroesDaRF.Any(padrao => fileName.Contains(padrao));
@@ -536,7 +724,9 @@ namespace Sittax.Cnpj.Workers
                 var href = match.Groups[1].Value;
                 if (!string.IsNullOrWhiteSpace(href))
                 {
-                    var fullUrl = href.StartsWith("http", StringComparison.OrdinalIgnoreCase) ? href : new Uri(new Uri(pageUrl), href).ToString();
+                    var fullUrl = href.StartsWith("http", StringComparison.OrdinalIgnoreCase)
+                        ? href
+                        : new Uri(new Uri(pageUrl), href).ToString();
 
                     urls.Add(fullUrl);
                 }
@@ -545,7 +735,8 @@ namespace Sittax.Cnpj.Workers
             return urls.Distinct().ToList();
         }
 
-        private async Task DownloadTodosArquivosAsync(List<string> urls, string periodo, CancellationToken cancellationToken)
+        private async Task DownloadTodosArquivosAsync(List<string> urls, string periodo,
+            CancellationToken cancellationToken)
         {
             var tasks = urls.Select(async url =>
             {
@@ -573,7 +764,8 @@ namespace Sittax.Cnpj.Workers
 
                     await logService.IniciarDownloadAsync(fileName, periodo, 0);
 
-                    var success = await DownloadArquivoComRetryAsync(url, filePath, fileName, periodo, cancellationToken);
+                    var success =
+                        await DownloadArquivoComRetryAsync(url, filePath, fileName, periodo, cancellationToken);
                     if (success)
                     {
                         var hashSha256 = await CalcularHashSha256Async(filePath);
@@ -615,7 +807,8 @@ namespace Sittax.Cnpj.Workers
                 }
                 catch (IOException ex) when (i < maxRetries - 1)
                 {
-                    _logger.LogDebug("Arquivo em uso, tentando novamente em {Delay}ms: {FilePath}", (i + 1) * 500, filePath);
+                    _logger.LogDebug("Arquivo em uso, tentando novamente em {Delay}ms: {FilePath}", (i + 1) * 500,
+                        filePath);
 
                     // Aguardar progressivamente mais tempo
                     await Task.Delay((i + 1) * 500);
@@ -636,7 +829,7 @@ namespace Sittax.Cnpj.Workers
             }
         }
 
-// Método auxiliar para mover arquivo com retry
+
         private async Task MoverArquivoComRetryAsync(string source, string destination)
         {
             const int maxRetries = 3;
@@ -667,7 +860,7 @@ namespace Sittax.Cnpj.Workers
             throw new IOException($"Não foi possível mover arquivo após {maxRetries} tentativas");
         }
 
-// Método para calcular hash com retry (arquivo pode estar travado temporariamente)
+
         private async Task<string> CalcularHashSha256AsyncComRetry(string filePath)
         {
             const int maxRetries = 3;
@@ -679,7 +872,8 @@ namespace Sittax.Cnpj.Workers
                     using var sha256 = System.Security.Cryptography.SHA256.Create();
 
                     // Usar FileShare.Read para permitir leitura simultânea
-                    using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 1024 * 1024, useAsync: true);
+                    using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read,
+                        bufferSize: 1024 * 1024, useAsync: true);
 
                     var hash = await sha256.ComputeHashAsync(stream);
                     return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
@@ -694,18 +888,21 @@ namespace Sittax.Cnpj.Workers
             throw new IOException($"Não foi possível calcular hash após {maxRetries} tentativas");
         }
 
-        private async Task<bool> DownloadArquivoComRetryAsync(string url, string filePath, string fileName, string periodo, CancellationToken cancellationToken)
+        private async Task<bool> DownloadArquivoComRetryAsync(string url, string filePath, string fileName,
+            string periodo, CancellationToken cancellationToken)
         {
             for (int tentativa = 1; tentativa <= _maxRetries; tentativa++)
             {
                 try
                 {
-                    _logger.LogInformation("🔄 Tentativa {Tentativa}/{MaxTentativas}: {FileName}", tentativa, _maxRetries, fileName);
+                    _logger.LogInformation("🔄 Tentativa {Tentativa}/{MaxTentativas}: {FileName}", tentativa,
+                        _maxRetries, fileName);
 
                     // Limpar arquivo parcial/travado antes de tentar novamente
                     await LimparArquivoComSegurancaAsync(filePath);
 
-                    using var response = await _httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+                    using var response = await _httpClient.GetAsync(url, HttpCompletionOption.ResponseHeadersRead,
+                        cancellationToken);
                     response.EnsureSuccessStatusCode();
 
                     // Obter tamanho do arquivo
@@ -729,13 +926,16 @@ namespace Sittax.Cnpj.Workers
                         using (var contentStream = await response.Content.ReadAsStreamAsync(cancellationToken))
                         {
                             // Usar FileOptions.Asynchronous e FileOptions.SequentialScan para melhor performance
-                            using (var fileStream = new FileStream(tempFilePath, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 1024 * 1024, useAsync: true))
+                            using (var fileStream = new FileStream(tempFilePath, FileMode.Create, FileAccess.Write,
+                                       FileShare.None, bufferSize: 1024 * 1024, useAsync: true))
                             {
                                 var buffer = new byte[64 * 1024]; // 64KB buffer
                                 long totalRead = 0;
                                 int bytesRead;
 
-                                while ((bytesRead = await contentStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken)) > 0)
+                                while ((bytesRead =
+                                           await contentStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken)) >
+                                       0)
                                 {
                                     await fileStream.WriteAsync(buffer, 0, bytesRead, cancellationToken);
                                     totalRead += bytesRead;
@@ -771,13 +971,16 @@ namespace Sittax.Cnpj.Workers
                         var realSize = finalFileInfo.Length;
                         var hashSha256 = await CalcularHashSha256AsyncComRetry(filePath);
 
-                        _logger.LogInformation("✅ Download completo: {FileName} - Tamanho: {Size}, Hash: {Hash}", fileName, FormatarBytes(realSize), hashSha256);
+                        _logger.LogInformation("✅ Download completo: {FileName} - Tamanho: {Size}, Hash: {Hash}",
+                            fileName, FormatarBytes(realSize), hashSha256);
 
                         // Atualizar o log com sucesso
                         using (var scope = _serviceProvider.CreateScope())
                         {
-                            var logService = scope.ServiceProvider.GetRequiredService<ReceitaFederalLogArquivosService>();
-                            await logService.FinalizarDownloadComTamanhoRealAsync(fileName, periodo, realSize, hashSha256, true);
+                            var logService =
+                                scope.ServiceProvider.GetRequiredService<ReceitaFederalLogArquivosService>();
+                            await logService.FinalizarDownloadComTamanhoRealAsync(fileName, periodo, realSize,
+                                hashSha256, true);
                         }
 
                         _progressManager.CompleteDownload(fileName, true);
@@ -791,7 +994,8 @@ namespace Sittax.Cnpj.Workers
                 }
                 catch (Exception ex) when (tentativa < _maxRetries)
                 {
-                    _logger.LogWarning("⚠️ Erro na tentativa {Tentativa} para {FileName}: {Erro}", tentativa, fileName, ex.Message);
+                    _logger.LogWarning("⚠️ Erro na tentativa {Tentativa} para {FileName}: {Erro}", tentativa, fileName,
+                        ex.Message);
 
                     _progressManager.CompleteDownload(fileName, false, $"Tentativa {tentativa} falhou: {ex.Message}");
 
@@ -801,7 +1005,8 @@ namespace Sittax.Cnpj.Workers
 
                     // Backoff exponencial com jitter
                     var delay = TimeSpan.FromSeconds(Math.Pow(2, tentativa) + Random.Shared.Next(1000, 5000) / 1000.0);
-                    _logger.LogInformation("⏳ Aguardando {Delay:F1}s antes da próxima tentativa...", delay.TotalSeconds);
+                    _logger.LogInformation("⏳ Aguardando {Delay:F1}s antes da próxima tentativa...",
+                        delay.TotalSeconds);
                     await Task.Delay(delay, cancellationToken);
                 }
                 catch (Exception ex)

@@ -8,6 +8,7 @@
 
     <ItemGroup>
       <ProjectReference Include="..\..\Sittax.Domain.Core\Sittax.Domain.Core.csproj" />
+      <ProjectReference Include="..\..\Sittax.Utils\Sittax.Utils.csproj" />
     </ItemGroup>
 
     <ItemGroup>

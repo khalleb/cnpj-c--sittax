@@ -5,6 +5,7 @@ using Microsoft.EntityFrameworkCore;
 
 using Sittax.Cnpj.Data;
 using Sittax.Cnpj.Data.Models;
+using Sittax.Utils;
 
 namespace Sittax.Cnpj.Services
 {
@@ -14,9 +15,9 @@ namespace Sittax.Cnpj.Services
         private readonly ILogger<ReceitaFederalCsvProcessorService> _logger;
         private readonly ReceitaFederalLogArquivosService _logService;
 
-        // Configurações de processamento
-        private const int BATCH_SIZE = 1000; // Tamanho do lote para insert
-        private const int COMMIT_INTERVAL = 10000; // Commit a cada N registros
+
+        private const int BATCH_SIZE = 2000;
+        private const int COMMIT_INTERVAL = 10000;
         private readonly Dictionary<string, TipoArquivoCsv> _tipoArquivoMap;
 
         public ReceitaFederalCsvProcessorService(IServiceProvider serviceProvider, ILogger<ReceitaFederalCsvProcessorService> logger, ReceitaFederalLogArquivosService logService)
@@ -25,7 +26,6 @@ namespace Sittax.Cnpj.Services
             _logger = logger;
             _logService = logService;
 
-            // Mapeamento de padrões de nome para tipo de arquivo
             _tipoArquivoMap = new Dictionary<string, TipoArquivoCsv>(StringComparer.OrdinalIgnoreCase)
             {
                 ["empresas"] = TipoArquivoCsv.Empresas,
@@ -49,43 +49,9 @@ namespace Sittax.Cnpj.Services
                 ["moticsv"] = TipoArquivoCsv.Motivos
             };
 
-            // Registrar encoding para arquivos da Receita Federal (ISO-8859-1 / Latin1)
             Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
         }
 
-        public async Task ProcessarTodosCsvsPendentesAsync(CancellationToken cancellationToken = default)
-        {
-            try
-            {
-                _logger.LogInformation("🚀 Iniciando processamento de todos os CSVs pendentes");
-
-                // Buscar arquivos extraídos mas não processados
-                var arquivosPendentes = await _logService.ObterArquivosPendentesProcessamentoAsync();
-
-                if (!arquivosPendentes.Any())
-                {
-                    _logger.LogInformation("Nenhum arquivo CSV pendente para processar");
-                    return;
-                }
-
-                _logger.LogInformation("Encontrados {Count} arquivo(s) para processar", arquivosPendentes.Count);
-
-                foreach (var arquivo in arquivosPendentes)
-                {
-                    if (cancellationToken.IsCancellationRequested)
-                        break;
-
-                    await ProcessarCsvIndividualAsync(arquivo.NomeArquivoCsv, arquivo.Periodo, cancellationToken);
-                }
-
-                _logger.LogInformation("✅ Processamento de CSVs concluído");
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Erro durante processamento de CSVs");
-                throw;
-            }
-        }
 
         public async Task ProcessarCsvIndividualAsync(string nomeArquivoCsv, string periodo, CancellationToken cancellationToken = default)
         {
@@ -139,6 +105,7 @@ namespace Sittax.Cnpj.Services
             }
         }
 
+
         private async Task<int> ProcessarEmpresasAsync(string caminhoArquivo, CancellationToken cancellationToken)
         {
             var totalProcessado = 0;
@@ -146,20 +113,17 @@ namespace Sittax.Cnpj.Services
 
             using var scope = _serviceProvider.CreateScope();
             var context = scope.ServiceProvider.GetRequiredService<SittaxCnpjDbContext>();
-
-            // Desabilitar tracking para melhor performance
             context.ChangeTracker.AutoDetectChangesEnabled = false;
 
-            await foreach (var linha in LerArquivoCsvAsync(caminhoArquivo, cancellationToken))
+            await foreach (var campos in CsvUtil.LerArquivoCsvAsync(caminhoArquivo, cancellationToken))
             {
                 try
                 {
-                    var campos = linha.Split(';');
                     if (campos.Length < 7) continue;
 
                     var empresa = new ReceitaFederalEmpresas
                     {
-                        CnpjBasico = campos[0].Trim(),
+                        CnpjBasico = LimparCampo(campos[0]) ?? string.Empty, // Aplicar LimparCampo aqui também
                         RazaoSocialNomeEmpresarial = LimparCampo(campos[1]),
                         NaturezaJuridica = LimparCampo(campos[2]),
                         QualificacaoResponsavel = LimparCampo(campos[3]),
@@ -184,11 +148,10 @@ namespace Sittax.Cnpj.Services
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "Erro ao processar linha: {Linha}", linha);
+                    _logger.LogWarning(ex, "Erro ao processar linha: {Linha}", campos);
                 }
             }
 
-            // Salvar último lote
             if (lote.Any())
             {
                 await SalvarLoteAsync(context, lote, "Empresas");
@@ -207,19 +170,18 @@ namespace Sittax.Cnpj.Services
             var context = scope.ServiceProvider.GetRequiredService<SittaxCnpjDbContext>();
             context.ChangeTracker.AutoDetectChangesEnabled = false;
 
-            await foreach (var linha in LerArquivoCsvAsync(caminhoArquivo, cancellationToken))
+            await foreach (var campos in CsvUtil.LerArquivoCsvAsync(caminhoArquivo, cancellationToken))
             {
                 try
                 {
-                    var campos = linha.Split(';');
                     if (campos.Length < 30) continue;
 
                     var estabelecimento = new ReceitaFederalEstabelecimentos
                     {
-                        CnpjBasico = campos[0].Trim(),
-                        CnpjOrdem = campos[1].Trim(),
-                        CnpjDv = campos[2].Trim(),
-                        CnpjCompleto = campos[0].Trim() + campos[1].Trim() + campos[2].Trim(),
+                        CnpjBasico = LimparCampo(campos[0].Trim()),
+                        CnpjOrdem = LimparCampo(campos[1].Trim()),
+                        CnpjDv = LimparCampo(campos[2].Trim()),
+                        CnpjCompleto = LimparCampo(campos[0].Trim()) + LimparCampo(campos[1].Trim()) + LimparCampo(campos[2].Trim()),
                         IdentificadorMatrizFilial = LimparCampo(campos[3]),
                         NomeFantasia = LimparCampo(campos[4]),
                         SituacaoCadastral = LimparCampo(campos[5]),
@@ -233,7 +195,7 @@ namespace Sittax.Cnpj.Services
                         TipoLogradouro = LimparCampo(campos[13]),
                         Logradouro = LimparCampo(campos[14]),
                         Numero = LimparCampo(campos[15]),
-                        Complemento = LimparCampo(campos[16]),
+                        Complemento = campos[16],
                         Bairro = LimparCampo(campos[17]),
                         Cep = LimparCampo(campos[18]),
                         Uf = LimparCampo(campos[19]),
@@ -248,6 +210,10 @@ namespace Sittax.Cnpj.Services
                         SituacaoEspecial = LimparCampo(campos[28]),
                         DataSituacaoEspecial = ParseData(campos[29])
                     };
+                    if (estabelecimento?.CnpjBasico?.Length > 8 || estabelecimento?.Cep?.Length > 8)
+                    {
+                        Console.WriteLine("sdsds");
+                    }
 
                     lote.Add(estabelecimento);
 
@@ -265,7 +231,7 @@ namespace Sittax.Cnpj.Services
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "Erro ao processar linha: {Linha}", linha);
+                    _logger.LogWarning(ex, "Erro ao processar linha: {Linha}", campos);
                 }
             }
 
@@ -278,6 +244,162 @@ namespace Sittax.Cnpj.Services
             return totalProcessado;
         }
 
+        public async Task LimparDadosAntigosAsync(string periodo, CancellationToken cancellationToken = default)
+        {
+            try
+            {
+                _logger.LogWarning("🧹 Iniciando limpeza de dados antigos para reprocessamento");
+
+                using var scope = _serviceProvider.CreateScope();
+                var context = scope.ServiceProvider.GetRequiredService<SittaxCnpjDbContext>();
+
+                // Obter contagem antes da limpeza
+                var counts = new Dictionary<string, int>
+                {
+                    ["Empresas"] = await context.ReceitaFederalEmpresas.CountAsync(cancellationToken),
+                    ["Estabelecimentos"] = await context.ReceitaFederalEstabelecimentos.CountAsync(cancellationToken),
+                    ["Sócios"] = await context.ReceitaFederalSocios.CountAsync(cancellationToken),
+                    ["Simples"] = await context.ReceitaFederalSimples.CountAsync(cancellationToken)
+                };
+
+                foreach (var kvp in counts.Where(x => x.Value > 0))
+                {
+                    _logger.LogInformation("📊 {Tabela}: {Count:N0} registros serão removidos", kvp.Key, kvp.Value);
+                }
+
+                // Executar TRUNCATE para cada tabela (mais rápido que DELETE)
+                var tables = new[] { "rf_socios", "rf_simples", "rf_estabelecimentos", "rf_empresas", "rf_cnaes", "rf_motivos", "rf_municipios", "rf_naturezas", "rf_paises", "rf_qualificacoes" };
+
+                foreach (var table in tables)
+                {
+                    await context.Database.ExecuteSqlRawAsync($"TRUNCATE TABLE {table} RESTART IDENTITY CASCADE", cancellationToken);
+                    _logger.LogDebug("✅ Tabela {Table} limpa", table);
+                }
+
+                _logger.LogInformation("✅ Limpeza de dados concluída");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ Erro ao limpar dados antigos");
+                throw;
+            }
+        }
+
+        public async Task<bool> ValidarIntegridadeDadosAsync(CancellationToken cancellationToken = default)
+        {
+            try
+            {
+                _logger.LogInformation("🔍 Validando integridade dos dados");
+
+                using var scope = _serviceProvider.CreateScope();
+                var context = scope.ServiceProvider.GetRequiredService<SittaxCnpjDbContext>();
+
+                var problemas = new List<string>();
+
+                // Validar estabelecimentos sem empresa correspondente
+                var estabelecimentosSemEmpresa = await context.Database.ExecuteSqlRawAsync(@"
+            SELECT COUNT(*)
+            FROM rf_estabelecimentos e
+            WHERE NOT EXISTS (
+                SELECT 1 FROM rf_empresas emp
+                WHERE emp.cnpj_basico = e.cnpj_basico
+            )", cancellationToken);
+
+                if (estabelecimentosSemEmpresa > 0)
+                {
+                    problemas.Add($"Encontrados {estabelecimentosSemEmpresa} estabelecimentos sem empresa correspondente");
+                }
+
+                // Validar sócios sem empresa correspondente
+                var sociosSemEmpresa = await context.Database.ExecuteSqlRawAsync(@"
+            SELECT COUNT(*)
+            FROM rf_socios s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM rf_empresas emp
+                WHERE emp.cnpj_basico = s.cnpj_basico
+            )", cancellationToken);
+
+                if (sociosSemEmpresa > 0)
+                {
+                    problemas.Add($"Encontrados {sociosSemEmpresa} sócios sem empresa correspondente");
+                }
+
+                // Validar CNAEs inválidos
+                var estabelecimentosCnaesInvalidos = await context.Database.ExecuteSqlRawAsync(@"
+            SELECT COUNT(*)
+            FROM rf_estabelecimentos e
+            WHERE e.cnae_fiscal_principal IS NOT NULL
+            AND e.cnae_fiscal_principal != ''
+            AND NOT EXISTS (
+                SELECT 1 FROM rf_cnaes c
+                WHERE c.codigo = e.cnae_fiscal_principal
+            )", cancellationToken);
+
+                if (estabelecimentosCnaesInvalidos > 0)
+                {
+                    problemas.Add($"Encontrados {estabelecimentosCnaesInvalidos} estabelecimentos com CNAE principal inválido");
+                }
+
+                if (problemas.Any())
+                {
+                    _logger.LogWarning("⚠️ Problemas de integridade encontrados:");
+                    foreach (var problema in problemas)
+                    {
+                        _logger.LogWarning("   - {Problema}", problema);
+                    }
+
+                    return false;
+                }
+
+                _logger.LogInformation("✅ Validação de integridade concluída sem problemas");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ Erro ao validar integridade");
+                return false;
+            }
+        }
+
+        public async Task<RelatorioProcessamento> GerarRelatorioProcessamentoAsync(string periodo, CancellationToken cancellationToken = default)
+        {
+            var relatorio = new RelatorioProcessamento { Periodo = periodo, DataProcessamento = DateTime.UtcNow };
+
+            try
+            {
+                using var scope = _serviceProvider.CreateScope();
+                var context = scope.ServiceProvider.GetRequiredService<SittaxCnpjDbContext>();
+
+                // Contagens gerais
+                relatorio.TotalEmpresas = await context.ReceitaFederalEmpresas.CountAsync(cancellationToken);
+                relatorio.TotalEstabelecimentos = await context.ReceitaFederalEstabelecimentos.CountAsync(cancellationToken);
+                relatorio.TotalSocios = await context.ReceitaFederalSocios.CountAsync(cancellationToken);
+                relatorio.TotalSimples = await context.ReceitaFederalSimples.CountAsync(cancellationToken);
+
+                // Estatísticas de estabelecimentos por situação
+                relatorio.EstabelecimentosAtivos = await context.ReceitaFederalEstabelecimentos.CountAsync(e => e.SituacaoCadastral == "02", cancellationToken);
+
+                relatorio.EstabelecimentosBaixados = await context.ReceitaFederalEstabelecimentos.CountAsync(e => e.SituacaoCadastral == "08", cancellationToken);
+
+                // Estatísticas por UF
+                relatorio.EstabelecimentosPorUf = await context.ReceitaFederalEstabelecimentos.Where(e => e.Uf != null).GroupBy(e => e.Uf).Select(g => new EstabelecimentosPorUf { Uf = g.Key, Total = g.Count() }).OrderBy(x => x.Uf)
+                    .ToListAsync(cancellationToken);
+
+                // Top 10 CNAEs
+                relatorio.TopCnaes = await context.ReceitaFederalEstabelecimentos.Where(e => e.CnaeFiscalPrincipal != null).GroupBy(e => e.CnaeFiscalPrincipal).Select(g => new TopCnae { Cnae = g.Key, Total = g.Count() })
+                    .OrderByDescending(x => x.Total).Take(10).ToListAsync(cancellationToken);
+
+                _logger.LogInformation("📊 Relatório de processamento gerado com sucesso");
+
+                return relatorio;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "❌ Erro ao gerar relatório");
+                throw;
+            }
+        }
+
         // Métodos auxiliares para outros tipos (implementar de forma similar)
         private async Task<int> ProcessarSociosAsync(string caminhoArquivo, CancellationToken cancellationToken)
         {
@@ -288,11 +410,10 @@ namespace Sittax.Cnpj.Services
             var context = scope.ServiceProvider.GetRequiredService<SittaxCnpjDbContext>();
             context.ChangeTracker.AutoDetectChangesEnabled = false;
 
-            await foreach (var linha in LerArquivoCsvAsync(caminhoArquivo, cancellationToken))
+            await foreach (var campos in CsvUtil.LerArquivoCsvAsync(caminhoArquivo, cancellationToken))
             {
                 try
                 {
-                    var campos = linha.Split(';');
                     if (campos.Length < 11) continue;
 
                     var socio = new ReceitaFederalSocios
@@ -336,7 +457,11 @@ namespace Sittax.Cnpj.Services
 
         private async Task<int> ProcessarCnaesAsync(string caminhoArquivo, CancellationToken cancellationToken)
         {
-            return await ProcessarTabelaAuxiliarAsync<ReceitaFederalCnaes>(caminhoArquivo, campos => new ReceitaFederalCnaes { Codigo = campos[0].Trim(), Descricao = LimparCampo(campos[1]) }, "CNAEs", cancellationToken);
+            return await ProcessarTabelaAuxiliarAsync<ReceitaFederalCnaes>(caminhoArquivo, campos => new ReceitaFederalCnaes
+            {
+                Codigo = LimparCampo(campos[0]) ?? string.Empty, // Usar LimparCampo aqui
+                Descricao = LimparCampo(campos[1])
+            }, "CNAEs", cancellationToken);
         }
 
         // Método genérico para tabelas auxiliares simples (código/descrição)
@@ -349,11 +474,10 @@ namespace Sittax.Cnpj.Services
             var context = scope.ServiceProvider.GetRequiredService<SittaxCnpjDbContext>();
             context.ChangeTracker.AutoDetectChangesEnabled = false;
 
-            await foreach (var linha in LerArquivoCsvAsync(caminhoArquivo, cancellationToken))
+            await foreach (var campos in CsvUtil.LerArquivoCsvAsync(caminhoArquivo, cancellationToken))
             {
                 try
                 {
-                    var campos = linha.Split(';');
                     if (campos.Length < 2) continue;
 
                     var entidade = criarEntidade(campos);
@@ -382,32 +506,83 @@ namespace Sittax.Cnpj.Services
         }
 
         // Implementar os demais processadores
-        private async Task<int> ProcessarSimplesAsync(string caminhoArquivo, CancellationToken cancellationToken) => await ProcessarTabelaAuxiliarAsync<ReceitaFederalSimples>(caminhoArquivo,
-            campos => new ReceitaFederalSimples
+        private async Task<int> ProcessarSimplesAsync(string caminhoArquivo, CancellationToken cancellationToken)
+        {
+            var totalProcessado = 0;
+            var lote = new List<ReceitaFederalSimples>(BATCH_SIZE);
+
+            using var scope = _serviceProvider.CreateScope();
+            var context = scope.ServiceProvider.GetRequiredService<SittaxCnpjDbContext>();
+            context.ChangeTracker.AutoDetectChangesEnabled = false;
+
+            await foreach (var campos in CsvUtil.LerArquivoCsvAsync(caminhoArquivo, cancellationToken))
             {
-                CnpjBasico = campos[0].Trim(),
-                OpcaoPeloSimples = LimparCampo(campos[1]),
-                DataOpcaoSimples = ParseData(campos[2]),
-                DataExclusaoSimples = ParseData(campos[3]),
-                OpcaoPeloMei = LimparCampo(campos[4]),
-                DataOpcaoMei = ParseData(campos[5]),
-                DataExclusaoMei = ParseData(campos[6])
-            }, "Simples", cancellationToken);
+                try
+                {
+                    if (campos.Length < 7) continue;
 
-        private async Task<int> ProcessarNaturezasAsync(string caminhoArquivo, CancellationToken cancellationToken) => await ProcessarTabelaAuxiliarAsync<ReceitaFederalNaturezas>(caminhoArquivo,
-            campos => new ReceitaFederalNaturezas { Codigo = campos[0].Trim(), Descricao = LimparCampo(campos[1]) }, "Naturezas", cancellationToken);
+                    var simples = new ReceitaFederalSimples
+                    {
+                        CnpjBasico = LimparCampo(campos[0]) ?? string.Empty,
+                        OpcaoPeloSimples = LimparCampo(campos[1]),
+                        DataOpcaoSimples = ParseData(campos[2]),
+                        DataExclusaoSimples = ParseData(campos[3]),
+                        OpcaoPeloMei = LimparCampo(campos[4]),
+                        DataOpcaoMei = ParseData(campos[5]),
+                        DataExclusaoMei = ParseData(campos[6])
+                    };
 
-        private async Task<int> ProcessarQualificacoesAsync(string caminhoArquivo, CancellationToken cancellationToken) => await ProcessarTabelaAuxiliarAsync<ReceitaFederalQualificacoes>(caminhoArquivo,
-            campos => new ReceitaFederalQualificacoes { Codigo = campos[0].Trim(), Descricao = LimparCampo(campos[1]) }, "Qualificações", cancellationToken);
+                    lote.Add(simples);
 
-        private async Task<int> ProcessarPaisesAsync(string caminhoArquivo, CancellationToken cancellationToken) =>
-            await ProcessarTabelaAuxiliarAsync<ReceitaFederalPaises>(caminhoArquivo, campos => new ReceitaFederalPaises { Codigo = campos[0].Trim(), Descricao = LimparCampo(campos[1]) }, "Países", cancellationToken);
+                    if (lote.Count >= BATCH_SIZE)
+                    {
+                        await SalvarLoteAsync(context, lote, "Simples");
+                        totalProcessado += lote.Count;
+                        lote.Clear();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Erro ao processar linha de Simples");
+                }
+            }
 
-        private async Task<int> ProcessarMunicipiosAsync(string caminhoArquivo, CancellationToken cancellationToken) => await ProcessarTabelaAuxiliarAsync<ReceitaFederalMunicipios>(caminhoArquivo,
-            campos => new ReceitaFederalMunicipios { Codigo = campos[0].Trim(), Descricao = LimparCampo(campos[1]) }, "Municípios", cancellationToken);
+            if (lote.Any())
+            {
+                await SalvarLoteAsync(context, lote, "Simples");
+                totalProcessado += lote.Count;
+            }
 
-        private async Task<int> ProcessarMotivosAsync(string caminhoArquivo, CancellationToken cancellationToken) =>
-            await ProcessarTabelaAuxiliarAsync<ReceitaFederalMotivos>(caminhoArquivo, campos => new ReceitaFederalMotivos { Codigo = campos[0].Trim(), Descricao = LimparCampo(campos[1]) }, "Motivos", cancellationToken);
+            return totalProcessado;
+        }
+
+        private async Task<int> ProcessarNaturezasAsync(string caminhoArquivo, CancellationToken cancellationToken)
+        {
+            return await ProcessarTabelaAuxiliarAsync<ReceitaFederalNaturezas>(caminhoArquivo, campos => new ReceitaFederalNaturezas { Codigo = LimparCampo(campos[0]) ?? string.Empty, Descricao = LimparCampo(campos[1]) }, "Naturezas",
+                cancellationToken);
+        }
+
+        private async Task<int> ProcessarQualificacoesAsync(string caminhoArquivo, CancellationToken cancellationToken)
+        {
+            return await ProcessarTabelaAuxiliarAsync<ReceitaFederalQualificacoes>(caminhoArquivo, campos => new ReceitaFederalQualificacoes { Codigo = LimparCampo(campos[0]) ?? string.Empty, Descricao = LimparCampo(campos[1]) }, "Qualificações",
+                cancellationToken);
+        }
+
+        private async Task<int> ProcessarPaisesAsync(string caminhoArquivo, CancellationToken cancellationToken)
+        {
+            return await ProcessarTabelaAuxiliarAsync<ReceitaFederalPaises>(caminhoArquivo, campos => new ReceitaFederalPaises { Codigo = LimparCampo(campos[0]) ?? string.Empty, Descricao = LimparCampo(campos[1]) }, "Países", cancellationToken);
+        }
+
+        private async Task<int> ProcessarMunicipiosAsync(string caminhoArquivo, CancellationToken cancellationToken)
+        {
+            return await ProcessarTabelaAuxiliarAsync<ReceitaFederalMunicipios>(caminhoArquivo, campos => new ReceitaFederalMunicipios { Codigo = LimparCampo(campos[0]) ?? string.Empty, Descricao = LimparCampo(campos[1]) }, "Municípios",
+                cancellationToken);
+        }
+
+        private async Task<int> ProcessarMotivosAsync(string caminhoArquivo, CancellationToken cancellationToken)
+        {
+            return await ProcessarTabelaAuxiliarAsync<ReceitaFederalMotivos>(caminhoArquivo, campos => new ReceitaFederalMotivos { Codigo = LimparCampo(campos[0]) ?? string.Empty, Descricao = LimparCampo(campos[1]) }, "Motivos", cancellationToken);
+        }
 
         // Métodos auxiliares
         private async Task SalvarLoteAsync<T>(DbContext context, List<T> lote, string nomeTabela) where T : class
@@ -427,40 +602,32 @@ namespace Sittax.Cnpj.Services
             }
         }
 
-        private async IAsyncEnumerable<string> LerArquivoCsvAsync(string caminhoArquivo, CancellationToken cancellationToken)
-        {
-            // Encoding Latin1 para arquivos da Receita Federal
-            using var reader = new StreamReader(caminhoArquivo, Encoding.GetEncoding("ISO-8859-1"));
-
-            string? linha;
-            var linhaNumero = 0;
-
-            while ((linha = await reader.ReadLineAsync()) != null)
-            {
-                linhaNumero++;
-
-                if (cancellationToken.IsCancellationRequested)
-                    yield break;
-
-                if (string.IsNullOrWhiteSpace(linha))
-                    continue;
-
-                yield return linha;
-
-                // Log de progresso
-                if (linhaNumero % 10000 == 0)
-                {
-                    _logger.LogDebug("Lidas {Count} linhas de {File}", linhaNumero, Path.GetFileName(caminhoArquivo));
-                }
-            }
-        }
-
         private string? LimparCampo(string? valor)
         {
             if (string.IsNullOrWhiteSpace(valor))
                 return null;
 
-            valor = valor.Trim().Trim('"');
+            // Remove espaços no início e fim
+            valor = valor.Trim();
+
+            // Remove aspas duplas no início e fim (podem ter múltiplas camadas)
+            while (valor.StartsWith("\"") && valor.EndsWith("\"") && valor.Length > 1)
+            {
+                valor = valor.Substring(1, valor.Length - 2);
+            }
+
+            // Remove aspas simples se existirem
+            while (valor.StartsWith("'") && valor.EndsWith("'") && valor.Length > 1)
+            {
+                valor = valor.Substring(1, valor.Length - 2);
+            }
+
+            // Limpa espaços novamente após remover as aspas
+            valor = valor.Trim();
+
+            // Substitui aspas duplas duplicadas por aspas simples (caso existam no meio do texto)
+            valor = valor.Replace("\"\"", "\"");
+
             return string.IsNullOrWhiteSpace(valor) ? null : valor;
         }
 
@@ -469,13 +636,15 @@ namespace Sittax.Cnpj.Services
             if (string.IsNullOrWhiteSpace(valor) || valor == "0" || valor == "00000000")
                 return null;
 
-            if (valor.Length == 8 && DateTime.TryParseExact(valor, "yyyyMMdd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var data))
+            if (valor.Length == 8 && DateTime.TryParseExact(valor, "yyyyMMdd",
+                    CultureInfo.InvariantCulture, DateTimeStyles.None, out var data))
             {
-                return data;
+                return DateTime.SpecifyKind(data, DateTimeKind.Utc);
             }
 
             return null;
         }
+
 
         private decimal? ParseDecimal(string? valor)
         {
@@ -507,6 +676,32 @@ namespace Sittax.Cnpj.Services
         {
             var baseDir = Path.Combine(Path.GetTempPath(), "receita_federal_dados", "extracted");
             return Path.Combine(baseDir, nomeArquivo);
+        }
+
+        public class RelatorioProcessamento
+        {
+            public string Periodo { get; set; } = string.Empty;
+            public DateTime DataProcessamento { get; set; }
+            public int TotalEmpresas { get; set; }
+            public int TotalEstabelecimentos { get; set; }
+            public int TotalSocios { get; set; }
+            public int TotalSimples { get; set; }
+            public int EstabelecimentosAtivos { get; set; }
+            public int EstabelecimentosBaixados { get; set; }
+            public List<EstabelecimentosPorUf> EstabelecimentosPorUf { get; set; } = new();
+            public List<TopCnae> TopCnaes { get; set; } = new();
+        }
+
+        public class EstabelecimentosPorUf
+        {
+            public string? Uf { get; set; }
+            public int Total { get; set; }
+        }
+
+        public class TopCnae
+        {
+            public string? Cnae { get; set; }
+            public int Total { get; set; }
         }
     }
 
